@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/otofune/cub/drive"
 	"github.com/otofune/cub/internal/clii"
@@ -16,7 +20,51 @@ import (
 	"google.golang.org/api/option"
 )
 
+const stateFile = "./state.json"
+
+func readState(path string) (map[string]struct{}, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var s []string
+	if err := json.NewDecoder(f).Decode(&s); err != nil {
+		return nil, err
+	}
+
+	rs := make(map[string]struct{})
+	for _, v := range s {
+		rs[v] = struct{}{}
+	}
+	return rs, nil
+}
+
+func writeState(path string, state map[string]struct{}) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return json.NewEncoder(f).Encode(maps.Keys(state))
+}
+
 func realMain(ctx context.Context, env mainenv.Env) error {
+	state, err := readState(stateFile)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		state = make(map[string]struct{})
+	}
+	defer func() {
+		if err := writeState(stateFile, state); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to save state: %v\n", err)
+		}
+	}()
+
 	targetFolPath := os.Args[1]
 	if len(os.Args[2:]) == 0 {
 		return errors.New("please give id")
@@ -88,10 +136,24 @@ func realMain(ctx context.Context, env mainenv.Env) error {
 		}
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	for i, id := range maps.Keys(targetIDs) {
-		fmt.Printf("Copying %d / %d (%s)\n", i, len(targetIDs), id)
+		if _, ok := state[id]; ok {
+			fmt.Printf("[SKIP] %d / %d (%s)\n", i, len(targetIDs), id)
+			continue
+		}
+		fmt.Printf("[COPYING] %d / %d (%s)\n", i, len(targetIDs), id)
 		if err := drive.Copy(ctx, hc, id, drive.CopyToDirectoryID(dirFile.Id)); err != nil {
 			return fmt.Errorf("failed to copy %s: %w", id, err)
+		}
+		state[id] = struct{}{}
+
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(os.Stderr, "exiting by signal\n")
+			return nil
+		default:
 		}
 	}
 
